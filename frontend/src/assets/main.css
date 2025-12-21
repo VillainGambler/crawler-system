@@ -1,0 +1,25 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Force the System Font */
+body {
+  font-family: 'Share Tech Mono', monospace;
+  background-color: #050505; /* Deep, deep black */
+  color: #e2e8f0;
+}
+
+/* Scrollbar Customization (Chrome/Safari) */
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #111; 
+}
+::-webkit-scrollbar-thumb {
+  background: #2f855a; 
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #48bb78; 
+}
