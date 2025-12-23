@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import CharacterView from '../views/CharacterView.vue'
 import HomeView from '../views/HomeView.vue' // <--- Import the new view
+import AdminPanel from '../components/AdminPanel.vue'
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
@@ -14,6 +15,11 @@ const router = createRouter({
       path: '/character/:id',
       name: 'character',
       component: CharacterView
+    },
+    {
+      path: '/admin',
+      name: 'admin',
+      component: AdminPanel
     }
   ]
 })

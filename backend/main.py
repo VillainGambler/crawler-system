@@ -1,187 +1,335 @@
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+import boto3
 import os
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from models import Character  
-import database
+import json
+from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
+from decimal import Decimal
 from pydantic import BaseModel
-from fastapi import WebSocket, WebSocketDisconnect
-from connection_manager import ConnectionManager
+from typing import Optional, Dict, Any
+import random
 
+app = FastAPI()
 
-# Initialize the Manager
+# --- DATA MODELS ---
+class ItemModel(BaseModel):
+    name: str
+    type: str
+    count: int = 1
+    stats: Optional[Dict[str, Any]] = None
+
+# --- DYNAMODB CONNECTION ---
+dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+table = dynamodb.Table('crawler-system-data')
+
+# --- WEBSOCKET MANAGER ---
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: dict[str, list[WebSocket]] = {}
+
+    async def connect(self, char_id: str, websocket: WebSocket):
+        await websocket.accept()
+        if char_id not in self.active_connections:
+            self.active_connections[char_id] = []
+        self.active_connections[char_id].append(websocket)
+
+    def disconnect(self, char_id: str, websocket: WebSocket):
+        if char_id in self.active_connections:
+            self.active_connections[char_id].remove(websocket)
+            if not self.active_connections[char_id]:
+                del self.active_connections[char_id]
+
+    async def broadcast(self, char_id: str, message: dict):
+        if char_id in self.active_connections:
+            json_msg = json.dumps(message, default=str)
+            for connection in self.active_connections[char_id]:
+                await connection.send_text(json_msg)
+
 manager = ConnectionManager()
 
-app = FastAPI(title="The Crawler System", version="0.2.0")
+# --- HELPER: Decimal Encoder ---
+# DynamoDB returns numbers as Decimals. We need to convert them to int for JSON.
+def convert_decimal(obj):
+    if isinstance(obj, list):
+        return [convert_decimal(i) for i in obj]
+    elif isinstance(obj, dict):
+        return {k: convert_decimal(v) for k, v in obj.items()}
+    elif isinstance(obj, Decimal):
+        return int(obj)
+    return obj
 
-# --- CORS CONFIGURATION (Crucial for iPad) ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allows all connections (Safe for local dev)
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# --- READ (GET) with DEBUG LOGGING ---
-@app.get("/character/{character_id}", response_model=Character)
-async def read_character(character_id: str):
+# --- HELPER: Get Character ---
+def get_character_from_db(char_id: str):
     try:
-        print(f"DEBUG: Attempting to fetch {character_id}...")
+        # UPDATED KEY STRUCTURE: CRAWL#101 / PLAYER#{id}
+        response = table.get_item(Key={'pk': 'CRAWL#101', 'sk': f"PLAYER#{char_id}"})
+        if 'Item' not in response:
+            return None
         
-        # 1. Fetch raw data from DynamoDB
-        data = database.get_character(character_id)
-        print(f"DEBUG: Database returned: {data}")
+        item = convert_decimal(response['Item'])
         
-        if not data:
-            print("DEBUG: Character not found in DB.")
-            raise HTTPException(status_code=404, detail="Character not found")
-        
-        # 2. Validate data manually to catch structure errors
-        print("DEBUG: Validating data against Pydantic model...")
-        validated_char = Character(**data)
-        print("DEBUG: Validation successful!")
-        
-        return validated_char
+        # Structure the data for the Frontend
+        # We fetch nested objects (hp, stats) directly since your DB has them nested
+        character_data = {
+            "name": item.get('name', 'Unknown'),
+            "race": item.get('race', 'Unknown'),
+            "player_class": item.get('player_class', 'Crawler'),
+            "level": item.get('level', 1),
+            "gold": int(item.get('gold', 0)),
+            "hp": {
+                "current": item.get('hp', {}).get('current', 10),
+                "max": item.get('hp', {}).get('max', 10),
+                "temp": 0
+            },
+            "stats": item.get('stats', {
+                "strength": 10, "dexterity": 10, "constitution": 10,
+                "intelligence": 10, "charisma": 10
+            }),
+            "skills": item.get('skills', {}),
+            "feats": item.get('feats', []),
+            "inventory": item.get('inventory', []),
+            "equipment": item.get('equipment', {})
+        }
+        return character_data
+    except ClientError as e:
+        print(f"DB Error: {e}")
+        return None
 
-    except Exception as e:
-        # This prints the REAL error to your terminal
-        print(f"CRITICAL ERROR: {type(e).__name__}: {str(e)}")
+# --- API ENDPOINTS ---
+
+class RollRequest(BaseModel):
+    skill_name: str
+
+@app.post("/character/{char_id}/roll")
+async def roll_skill(char_id: str, request: RollRequest):
+    """
+    Rolls a d20 + Skill Modifier.
+    """
+    char_data = get_character_from_db(char_id)
+    if not char_data:
+        raise HTTPException(status_code=404)
+
+    skill_name = request.skill_name.lower()
+    # Default to 0 if skill not found
+    modifier = char_data['skills'].get(skill_name, 0)
+    
+    # THE ROLL
+    d20 = random.randint(1, 20)
+    total = d20 + modifier
+    
+    # Crit Logic
+    crit_msg = ""
+    if d20 == 20:
+        crit_msg = " [CRITICAL SUCCESS!]"
+    elif d20 == 1:
+        crit_msg = " [CRITICAL FAILURE!]"
+
+    # Broadcast Log
+    log_msg = f"Rolled {request.skill_name.title()}: {d20} + {modifier} = {total}{crit_msg}"
+    
+    await manager.broadcast(char_id, {"type": "log", "message": log_msg})
+    
+    # We also send a special "roll_result" event so the frontend can show a popup
+    await manager.broadcast(char_id, {
+        "type": "roll_result", 
+        "payload": {
+            "skill": request.skill_name,
+            "d20": d20,
+            "mod": modifier,
+            "total": total,
+            "crit": d20 == 20 or d20 == 1
+        }
+    })
+    
+    return {"status": "success", "total": total}
+
+@app.post("/character/{char_id}/add-item")
+async def add_item(char_id: str, item: ItemModel):
+    """
+    God Mode: Grant an item to a player.
+    """
+    char_data = get_character_from_db(char_id)
+    if not char_data:
+        raise HTTPException(status_code=404)
+        
+    inventory = char_data['inventory']
+    
+    # Check if item already exists (stack it)
+    found = False
+    for inv_item in inventory:
+        if inv_item['name'] == item.name and inv_item.get('type') == item.type:
+            current_count = inv_item.get('count', 1)
+            inv_item['count'] = current_count + item.count
+            found = True
+            break
+            
+    # If not found, append new item
+    if not found:
+        new_item = item.dict()
+        inventory.append(new_item)
+        
+    # Save to DB
+    table.update_item(
+        Key={'pk': 'CRAWL#101', 'sk': f"PLAYER#{char_id}"},
+        UpdateExpression="SET inventory = :inv",
+        ExpressionAttributeValues={':inv': inventory}
+    )
+
+@app.post("/character/{char_id}/level-up")
+async def level_up(char_id: str):
+    """
+    Increases Level by 1 and heals to max.
+    """
+    try:
+        # Atomic update: Level + 1
+        table.update_item(
+            Key={'pk': 'CRAWL#101', 'sk': f"PLAYER#{char_id}"},
+            UpdateExpression="SET #l = #l + :val",
+            ExpressionAttributeNames={'#l': 'level'},
+            ExpressionAttributeValues={':val': 1}
+        )
+        
+        # Get new state
+        updated_char = get_character_from_db(char_id)
+        
+        # Broadcast
+        await manager.broadcast(char_id, {"type": "update", "payload": updated_char})
+        await manager.broadcast(char_id, {"type": "log", "message": f"LEVEL UP! You are now Level {updated_char['level']}!"})
+        
+        return {"status": "success", "new_level": updated_char['level']}
+    except ClientError as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-# --- CREATE (POST) ---
-@app.post("/character/", response_model=Character)
-async def create_new_character(character: Character):
-    """
-    Save a new character to the Cloud.
-    """
-    # Convert Pydantic model to a standard Dictionary
-    character_dict = character.model_dump()
     
-    # Send to AWS
-    database.create_character(character_dict)
+    # Broadcast Update
+    updated_char = get_character_from_db(char_id)
+    await manager.broadcast(char_id, {"type": "update", "payload": updated_char})
+    await manager.broadcast(char_id, {"type": "log", "message": f"SYSTEM GRANTED: {item.name} (x{item.count})"})
     
-    return character
+    return {"status": "success", "inventory": inventory}
 
-# --- NEW DATA MODEL (For the request body) ---
-class DamageRequest(BaseModel):
-    amount: int  # e.g., -5 for damage, +5 for healing
-
-@app.post("/character/{character_id}/adjust-hp")
-async def adjust_hp(character_id: str, action: DamageRequest):
-    # 1. Update DB & Get Full Character
-    full_char = database.update_hp(character_id, action.amount)
-    if not full_char:
-        raise HTTPException(status_code=500, detail="Failed to update HP")
-
-    # 2. Prepare Data
-    hp_block = full_char.get("hp", {})
-    clean_hp = {k: int(v) for k, v in hp_block.items()}
-    char_name = full_char.get("name", "Unknown Crawler") # Get name for the log
-
-    # 3. Broadcast 1: The Number Change
-    await manager.broadcast(character_id, {"type": "HP_UPDATE", "new_hp": clean_hp})
-
-    # 4. Broadcast 2: The Combat Log
-    # Determine flavor text
-    if action.amount > 0:
-        log_msg = f"{char_name} healed for {action.amount} HP."
-    else:
-        log_msg = f"{char_name} took {abs(action.amount)} damage!"
-
-    await manager.broadcast(character_id, {"type": "LOG", "message": log_msg})
-    
-    return {"status": "success", "new_hp": clean_hp}
-# --- NEW MODEL ---
-class ItemRequest(BaseModel):
-    item_name: str
-
-# --- NEW ENDPOINT ---
-@app.post("/character/{character_id}/use-item")
-async def use_item(character_id: str, request: ItemRequest):
-    """
-    Finds an item, decreases count by 1 (or removes it), saves, and narrates the action.
-    """
-    print(f"DEBUG: {character_id} is trying to use {request.item_name}...")
-
-    # 1. Fetch current state
-    data = database.get_character(character_id)
+@app.get("/character/{char_id}")
+async def get_character(char_id: str):
+    data = get_character_from_db(char_id)
     if not data:
         raise HTTPException(status_code=404, detail="Character not found")
+    return data
+
+@app.post("/character/{char_id}/adjust-gold")
+async def adjust_gold(char_id: str, amount: int):
+    """
+    Adjusts Gold by 'amount' (Positive to give, Negative to take).
+    """
+    try:
+        # 1. Update DynamoDB (Atomic Update)
+        # If 'gold' doesn't exist yet, this might fail without an if_not_exists, 
+        # so we use a robust expression: SET gold = if_not_exists(gold, :zero) + :val
+        table.update_item(
+            Key={'pk': 'CRAWL#101', 'sk': f"PLAYER#{char_id}"},
+            UpdateExpression="SET gold = if_not_exists(gold, :zero) + :val",
+            ExpressionAttributeValues={':val': amount, ':zero': 0},
+            ReturnValues="UPDATED_NEW"
+        )
+        
+        # 2. Broadcast
+        updated_char = get_character_from_db(char_id)
+        await manager.broadcast(char_id, {"type": "update", "payload": updated_char})
+        
+        # 3. Log
+        action = "Received" if amount > 0 else "Paid"
+        log_msg = f"FINANCE: {action} {abs(amount)} Gold."
+        await manager.broadcast(char_id, {"type": "log", "message": log_msg})
+        
+        return {"status": "success", "new_gold": updated_char['gold']}
+        
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/character/{char_id}/adjust-hp")
+async def adjust_hp(char_id: str, amount: int):
+    try:
+        # UPDATED: We need to update the NESTED map 'hp.current'
+        # We use ExpressionAttributeNames to safely target "hp" and "current"
+        response = table.update_item(
+            Key={'pk': 'CRAWL#101', 'sk': f"PLAYER#{char_id}"},
+            UpdateExpression="SET #h.#c = #h.#c + :val",
+            ExpressionAttributeNames={'#h': 'hp', '#c': 'current'},
+            ExpressionAttributeValues={':val': amount},
+            ReturnValues="UPDATED_NEW"
+        )
+        
+        # Broadcast
+        updated_char = get_character_from_db(char_id)
+        await manager.broadcast(char_id, {"type": "update", "payload": updated_char})
+        
+        # Log
+        action = "Healed" if amount > 0 else "Took Damage"
+        log_msg = f"{action} ({abs(amount)}). HP is now {updated_char['hp']['current']}."
+        await manager.broadcast(char_id, {"type": "log", "message": log_msg})
+        
+        return {"status": "success"}
+        
+    except ClientError as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/character/{char_id}/use-item")
+async def use_item(char_id: str, item_index: int):
+    # Fetch -> Modify -> Save pattern is safest for list manipulation
+    char_data = get_character_from_db(char_id)
+    if not char_data:
+        raise HTTPException(status_code=404)
+        
+    inventory = char_data['inventory']
     
-    character = Character(**data)
-
-    # 2. Find and Modify the Item
-    found = False
-    for i, item in enumerate(character.inventory):
-        if item.name == request.item_name:
-            found = True
-            if item.count > 1:
-                item.count -= 1
-                print(f"DEBUG: Decremented {item.name} to {item.count}")
-            else:
-                # Remove it entirely if count was 1
-                character.inventory.pop(i)
-                print(f"DEBUG: Consumed last {item.name}")
-            break
+    if item_index < 0 or item_index >= len(inventory):
+        raise HTTPException(status_code=400, detail="Invalid item index")
+        
+    item = inventory[item_index]
+    item_name = item['name']
     
-    if not found:
-        raise HTTPException(status_code=404, detail="Item not found in inventory")
-
-    # 3. Save to Database
-    # We convert the Pydantic model back to a dictionary for DynamoDB
-    updated_data = character.model_dump()
-    success = database.create_character(updated_data)
-
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to save inventory")
-
-    # 4. Broadcast Updates
-    # A) Tell frontend to reload data (syncs the inventory count)
-    await manager.broadcast(character_id, {"type": "FULL_REFRESH"})
+    # Logic: If count > 1, decrease count. Else remove.
+    # Note: DB might store count as int or might allow missing count (implies 1)
+    current_count = item.get('count', 1)
     
-    # B) Tell frontend to add a log entry
-    await manager.broadcast(character_id, {
-        "type": "LOG", 
-        "message": f"{character.name} used {request.item_name}."
-    })
+    if current_count > 1:
+        inventory[item_index]['count'] = current_count - 1
+    else:
+        inventory.pop(item_index)
+        
+    # Save back to DB
+    table.update_item(
+        Key={'pk': 'CRAWL#101', 'sk': f"PLAYER#{char_id}"},
+        UpdateExpression="SET inventory = :inv",
+        ExpressionAttributeValues={':inv': inventory}
+    )
+    
+    updated_char = get_character_from_db(char_id)
+    await manager.broadcast(char_id, {"type": "update", "payload": updated_char})
+    await manager.broadcast(char_id, {"type": "log", "message": f"Used {item_name}."})
+    
+    return {"status": "success", "inventory": inventory}
 
-    return character
-
-@app.websocket("/ws/{character_id}")
-async def websocket_endpoint(websocket: WebSocket, character_id: str):
-    await manager.connect(websocket, character_id)
+@app.websocket("/ws/{char_id}")
+async def websocket_endpoint(websocket: WebSocket, char_id: str):
+    await manager.connect(char_id, websocket)
     try:
         while True:
-            # We just listen. We don't expect the client to say much, 
-            # but we need this loop to keep the connection alive.
             await websocket.receive_text()
     except WebSocketDisconnect:
-        manager.disconnect(websocket, character_id)
-# --- STATIC FILES (THE FRONTEND) ---
+        manager.disconnect(char_id, websocket)
 
-# Get the absolute path to the frontend/dist folder
-# We assume backend/main.py is one level deeper than the project root
-# So we go up one level (..), then into frontend/dist
+# --- DEPLOYMENT ---
 frontend_path = os.path.join(os.path.dirname(__file__), "../frontend/dist")
-
-# 1. Mount the 'assets' folder (CSS/JS)
-app.mount("/assets", StaticFiles(directory=os.path.join(frontend_path, "assets")), name="assets")
-
-@app.get("/")
-async def serve_root():
-    return FileResponse(os.path.join(frontend_path, "index.html"))
-
-# 2. Catch-All Route for SPA (Single Page Application)
-# If the user goes to /character/carl, Vue handles it, not Python.
-# So Python just needs to return index.html and let Vue take over.
-@app.get("/{full_path:path}")
-async def serve_spa(full_path: str):
-    # If API is requested, but not found, return 404 (don't serve HTML)
-    if full_path.startswith("api") or full_path.startswith("ws"):
-        raise HTTPException(status_code=404)
-    
-    # Otherwise, return the app
-    return FileResponse(os.path.join(frontend_path, "index.html"))
+if os.path.exists(frontend_path):
+    app.mount("/assets", StaticFiles(directory=os.path.join(frontend_path, "assets")), name="assets")
+    @app.get("/")
+    async def serve_root():
+        return FileResponse(os.path.join(frontend_path, "index.html"))
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        if full_path.startswith("api") or full_path.startswith("ws"):
+            raise HTTPException(status_code=404)
+        return FileResponse(os.path.join(frontend_path, "index.html"))
