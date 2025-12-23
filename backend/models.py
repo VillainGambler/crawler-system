@@ -1,24 +1,27 @@
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 
-# --- SUB-MODELS (The ingredients) ---
+# --- SUB-MODELS ---
 
 class Stats(BaseModel):
-    strength: int = Field(ge=0)
-    dexterity: int = Field(ge=0)
-    constitution: int = Field(ge=0)
-    intelligence: int = Field(ge=0)
-    charisma: int = Field(ge=0)
+    strength: int = Field(default=10, ge=0)
+    dexterity: int = Field(default=10, ge=0)
+    constitution: int = Field(default=10, ge=0)
+    intelligence: int = Field(default=10, ge=0)
+    charisma: int = Field(default=10, ge=0)
 
 class Vitals(BaseModel):
-    current: int
-    max: int
+    current: int = 10
+    max: int = 10
+    temp: int = 0
 
 class Item(BaseModel):
     name: str
     type: str = "General"
     count: int = 1
     description: Optional[str] = None
+    # Added stats to match Frontend/Game logic
+    stats: Optional[Dict[str, Any]] = None
 
 class EquipmentSlot(BaseModel):
     name: str
@@ -26,31 +29,28 @@ class EquipmentSlot(BaseModel):
     stats: Optional[Dict[str, int]] = None
 
 class Equipment(BaseModel):
-    # Optional because you might be naked
     right_hand: Optional[EquipmentSlot] = None
     left_hand: Optional[EquipmentSlot] = None
     head: Optional[EquipmentSlot] = None
     body: Optional[EquipmentSlot] = None
     feet: Optional[EquipmentSlot] = None
 
-# --- MAIN MODEL (The Character Sheet) ---
+# --- MAIN MODEL ---
 
 class Character(BaseModel):
     id: str
     name: str
     race: str = "Unknown"
-    player_class: str = "Peasant"
+    player_class: str = "Crawler"
     level: int = 1
+    gold: int = 0
     
-    # Nested Models
     stats: Stats
     hp: Vitals
-    mp: Vitals
-    sp: Vitals
+    mp: Optional[Vitals] = None
+    sp: Optional[Vitals] = None
     
-    # The Missing Pieces!
-    skills: Dict[str, int] = {}     # e.g. {"explosives": 10}
-    feats: List[str] = []           # e.g. ["Toughness"]
-    inventory: List[Item] = []      # The Backpack
-    equipment: Equipment = {}       # The Armor/Weapons
-    hotbar: List[Optional[Any]] = [None] * 6 # 6 Quick Slots
+    skills: Dict[str, int] = {}
+    feats: List[str] = []
+    inventory: List[Item] = []
+    equipment: Equipment = {}
