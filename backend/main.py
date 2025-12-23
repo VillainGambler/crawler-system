@@ -1,6 +1,7 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Security, Depends, status
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.security import APIKeyHeader
 import boto3
 import os
 import json
@@ -10,8 +11,36 @@ from decimal import Decimal
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import random
+from dotenv import load_dotenv
+
+# Load Env for Local Dev (Ensure GM_ACCESS_TOKEN is in your .env)
+load_dotenv()
 
 app = FastAPI()
+
+# --- SECURITY PROTOCOL ---
+API_KEY_NAME = "X-GM-Key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+async def get_gm_access(api_key_header: str = Security(api_key_header)):
+    """
+    Validates the existence and correctness of the GM Token.
+    """
+    correct_key = os.getenv("GM_ACCESS_TOKEN")
+    
+    if not correct_key:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Security Protocol Failure: Server GM Token undefined."
+        )
+
+    if api_key_header == correct_key:
+        return True
+    
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="ACCESS DENIED: Invalid GM Credentials."
+    )
 
 # --- DATA MODELS ---
 class ItemModel(BaseModel):
@@ -19,6 +48,9 @@ class ItemModel(BaseModel):
     type: str
     count: int = 1
     stats: Optional[Dict[str, Any]] = None
+
+class RollRequest(BaseModel):
+    skill_name: str
 
 # --- DYNAMODB CONNECTION ---
 dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
@@ -50,7 +82,6 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 # --- HELPER: Decimal Encoder ---
-# DynamoDB returns numbers as Decimals. We need to convert them to int for JSON.
 def convert_decimal(obj):
     if isinstance(obj, list):
         return [convert_decimal(i) for i in obj]
@@ -63,15 +94,12 @@ def convert_decimal(obj):
 # --- HELPER: Get Character ---
 def get_character_from_db(char_id: str):
     try:
-        # UPDATED KEY STRUCTURE: CRAWL#101 / PLAYER#{id}
         response = table.get_item(Key={'pk': 'CRAWL#101', 'sk': f"PLAYER#{char_id}"})
         if 'Item' not in response:
             return None
         
         item = convert_decimal(response['Item'])
         
-        # Structure the data for the Frontend
-        # We fetch nested objects (hp, stats) directly since your DB has them nested
         character_data = {
             "name": item.get('name', 'Unknown'),
             "race": item.get('race', 'Unknown'),
@@ -97,41 +125,34 @@ def get_character_from_db(char_id: str):
         print(f"DB Error: {e}")
         return None
 
-# --- API ENDPOINTS ---
+# --- PUBLIC ENDPOINTS (Read Only / Player Actions) ---
 
-class RollRequest(BaseModel):
-    skill_name: str
+@app.get("/character/{char_id}")
+async def get_character(char_id: str):
+    data = get_character_from_db(char_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="Character not found")
+    return data
 
 @app.post("/character/{char_id}/roll")
 async def roll_skill(char_id: str, request: RollRequest):
-    """
-    Rolls a d20 + Skill Modifier.
-    """
     char_data = get_character_from_db(char_id)
     if not char_data:
         raise HTTPException(status_code=404)
 
     skill_name = request.skill_name.lower()
-    # Default to 0 if skill not found
     modifier = char_data['skills'].get(skill_name, 0)
     
-    # THE ROLL
     d20 = random.randint(1, 20)
     total = d20 + modifier
     
-    # Crit Logic
     crit_msg = ""
-    if d20 == 20:
-        crit_msg = " [CRITICAL SUCCESS!]"
-    elif d20 == 1:
-        crit_msg = " [CRITICAL FAILURE!]"
+    if d20 == 20: crit_msg = " [CRITICAL SUCCESS!]"
+    elif d20 == 1: crit_msg = " [CRITICAL FAILURE!]"
 
-    # Broadcast Log
     log_msg = f"Rolled {request.skill_name.title()}: {d20} + {modifier} = {total}{crit_msg}"
     
     await manager.broadcast(char_id, {"type": "log", "message": log_msg})
-    
-    # We also send a special "roll_result" event so the frontend can show a popup
     await manager.broadcast(char_id, {
         "type": "roll_result", 
         "payload": {
@@ -145,161 +166,27 @@ async def roll_skill(char_id: str, request: RollRequest):
     
     return {"status": "success", "total": total}
 
-@app.post("/character/{char_id}/add-item")
-async def add_item(char_id: str, item: ItemModel):
-    """
-    God Mode: Grant an item to a player.
-    """
-    char_data = get_character_from_db(char_id)
-    if not char_data:
-        raise HTTPException(status_code=404)
-        
-    inventory = char_data['inventory']
-    
-    # Check if item already exists (stack it)
-    found = False
-    for inv_item in inventory:
-        if inv_item['name'] == item.name and inv_item.get('type') == item.type:
-            current_count = inv_item.get('count', 1)
-            inv_item['count'] = current_count + item.count
-            found = True
-            break
-            
-    # If not found, append new item
-    if not found:
-        new_item = item.dict()
-        inventory.append(new_item)
-        
-    # Save to DB
-    table.update_item(
-        Key={'pk': 'CRAWL#101', 'sk': f"PLAYER#{char_id}"},
-        UpdateExpression="SET inventory = :inv",
-        ExpressionAttributeValues={':inv': inventory}
-    )
-
-@app.post("/character/{char_id}/level-up")
-async def level_up(char_id: str):
-    """
-    Increases Level by 1 and heals to max.
-    """
-    try:
-        # Atomic update: Level + 1
-        table.update_item(
-            Key={'pk': 'CRAWL#101', 'sk': f"PLAYER#{char_id}"},
-            UpdateExpression="SET #l = #l + :val",
-            ExpressionAttributeNames={'#l': 'level'},
-            ExpressionAttributeValues={':val': 1}
-        )
-        
-        # Get new state
-        updated_char = get_character_from_db(char_id)
-        
-        # Broadcast
-        await manager.broadcast(char_id, {"type": "update", "payload": updated_char})
-        await manager.broadcast(char_id, {"type": "log", "message": f"LEVEL UP! You are now Level {updated_char['level']}!"})
-        
-        return {"status": "success", "new_level": updated_char['level']}
-    except ClientError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-    # Broadcast Update
-    updated_char = get_character_from_db(char_id)
-    await manager.broadcast(char_id, {"type": "update", "payload": updated_char})
-    await manager.broadcast(char_id, {"type": "log", "message": f"SYSTEM GRANTED: {item.name} (x{item.count})"})
-    
-    return {"status": "success", "inventory": inventory}
-
-@app.get("/character/{char_id}")
-async def get_character(char_id: str):
-    data = get_character_from_db(char_id)
-    if not data:
-        raise HTTPException(status_code=404, detail="Character not found")
-    return data
-
-@app.post("/character/{char_id}/adjust-gold")
-async def adjust_gold(char_id: str, amount: int):
-    """
-    Adjusts Gold by 'amount' (Positive to give, Negative to take).
-    """
-    try:
-        # 1. Update DynamoDB (Atomic Update)
-        # If 'gold' doesn't exist yet, this might fail without an if_not_exists, 
-        # so we use a robust expression: SET gold = if_not_exists(gold, :zero) + :val
-        table.update_item(
-            Key={'pk': 'CRAWL#101', 'sk': f"PLAYER#{char_id}"},
-            UpdateExpression="SET gold = if_not_exists(gold, :zero) + :val",
-            ExpressionAttributeValues={':val': amount, ':zero': 0},
-            ReturnValues="UPDATED_NEW"
-        )
-        
-        # 2. Broadcast
-        updated_char = get_character_from_db(char_id)
-        await manager.broadcast(char_id, {"type": "update", "payload": updated_char})
-        
-        # 3. Log
-        action = "Received" if amount > 0 else "Paid"
-        log_msg = f"FINANCE: {action} {abs(amount)} Gold."
-        await manager.broadcast(char_id, {"type": "log", "message": log_msg})
-        
-        return {"status": "success", "new_gold": updated_char['gold']}
-        
-    except ClientError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/character/{char_id}/adjust-hp")
-async def adjust_hp(char_id: str, amount: int):
-    try:
-        # UPDATED: We need to update the NESTED map 'hp.current'
-        # We use ExpressionAttributeNames to safely target "hp" and "current"
-        response = table.update_item(
-            Key={'pk': 'CRAWL#101', 'sk': f"PLAYER#{char_id}"},
-            UpdateExpression="SET #h.#c = #h.#c + :val",
-            ExpressionAttributeNames={'#h': 'hp', '#c': 'current'},
-            ExpressionAttributeValues={':val': amount},
-            ReturnValues="UPDATED_NEW"
-        )
-        
-        # Broadcast
-        updated_char = get_character_from_db(char_id)
-        await manager.broadcast(char_id, {"type": "update", "payload": updated_char})
-        
-        # Log
-        action = "Healed" if amount > 0 else "Took Damage"
-        log_msg = f"{action} ({abs(amount)}). HP is now {updated_char['hp']['current']}."
-        await manager.broadcast(char_id, {"type": "log", "message": log_msg})
-        
-        return {"status": "success"}
-        
-    except ClientError as e:
-        print(e)
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.post("/character/{char_id}/use-item")
 async def use_item(char_id: str, item_index: int):
-    # Fetch -> Modify -> Save pattern is safest for list manipulation
+    # This remains public so players can use their own items.
+    # Ideally, you'd want player-specific auth here later.
     char_data = get_character_from_db(char_id)
     if not char_data:
         raise HTTPException(status_code=404)
         
     inventory = char_data['inventory']
-    
     if item_index < 0 or item_index >= len(inventory):
         raise HTTPException(status_code=400, detail="Invalid item index")
         
     item = inventory[item_index]
     item_name = item['name']
     
-    # Logic: If count > 1, decrease count. Else remove.
-    # Note: DB might store count as int or might allow missing count (implies 1)
     current_count = item.get('count', 1)
-    
     if current_count > 1:
         inventory[item_index]['count'] = current_count - 1
     else:
         inventory.pop(item_index)
         
-    # Save back to DB
     table.update_item(
         Key={'pk': 'CRAWL#101', 'sk': f"PLAYER#{char_id}"},
         UpdateExpression="SET inventory = :inv",
@@ -311,6 +198,91 @@ async def use_item(char_id: str, item_index: int):
     await manager.broadcast(char_id, {"type": "log", "message": f"Used {item_name}."})
     
     return {"status": "success", "inventory": inventory}
+
+# --- SECURE ENDPOINTS (GM Only) ---
+
+@app.post("/character/{char_id}/add-item", dependencies=[Depends(get_gm_access)])
+async def add_item(char_id: str, item: ItemModel):
+    char_data = get_character_from_db(char_id)
+    if not char_data:
+        raise HTTPException(status_code=404)
+        
+    inventory = char_data['inventory']
+    found = False
+    for inv_item in inventory:
+        if inv_item['name'] == item.name and inv_item.get('type') == item.type:
+            current_count = inv_item.get('count', 1)
+            inv_item['count'] = current_count + item.count
+            found = True
+            break
+            
+    if not found:
+        new_item = item.dict()
+        inventory.append(new_item)
+        
+    table.update_item(
+        Key={'pk': 'CRAWL#101', 'sk': f"PLAYER#{char_id}"},
+        UpdateExpression="SET inventory = :inv",
+        ExpressionAttributeValues={':inv': inventory}
+    )
+    
+    updated_char = get_character_from_db(char_id)
+    await manager.broadcast(char_id, {"type": "update", "payload": updated_char})
+    await manager.broadcast(char_id, {"type": "log", "message": f"SYSTEM GRANTED: {item.name} (x{item.count})"})
+    return {"status": "success", "inventory": inventory}
+
+@app.post("/character/{char_id}/level-up", dependencies=[Depends(get_gm_access)])
+async def level_up(char_id: str):
+    try:
+        table.update_item(
+            Key={'pk': 'CRAWL#101', 'sk': f"PLAYER#{char_id}"},
+            UpdateExpression="SET #l = #l + :val",
+            ExpressionAttributeNames={'#l': 'level'},
+            ExpressionAttributeValues={':val': 1}
+        )
+        updated_char = get_character_from_db(char_id)
+        await manager.broadcast(char_id, {"type": "update", "payload": updated_char})
+        await manager.broadcast(char_id, {"type": "log", "message": f"LEVEL UP! You are now Level {updated_char['level']}!"})
+        return {"status": "success", "new_level": updated_char['level']}
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/character/{char_id}/adjust-gold", dependencies=[Depends(get_gm_access)])
+async def adjust_gold(char_id: str, amount: int):
+    try:
+        table.update_item(
+            Key={'pk': 'CRAWL#101', 'sk': f"PLAYER#{char_id}"},
+            UpdateExpression="SET gold = if_not_exists(gold, :zero) + :val",
+            ExpressionAttributeValues={':val': amount, ':zero': 0},
+            ReturnValues="UPDATED_NEW"
+        )
+        updated_char = get_character_from_db(char_id)
+        await manager.broadcast(char_id, {"type": "update", "payload": updated_char})
+        action = "Received" if amount > 0 else "Paid"
+        log_msg = f"FINANCE: {action} {abs(amount)} Gold."
+        await manager.broadcast(char_id, {"type": "log", "message": log_msg})
+        return {"status": "success", "new_gold": updated_char['gold']}
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/character/{char_id}/adjust-hp", dependencies=[Depends(get_gm_access)])
+async def adjust_hp(char_id: str, amount: int):
+    try:
+        table.update_item(
+            Key={'pk': 'CRAWL#101', 'sk': f"PLAYER#{char_id}"},
+            UpdateExpression="SET #h.#c = #h.#c + :val",
+            ExpressionAttributeNames={'#h': 'hp', '#c': 'current'},
+            ExpressionAttributeValues={':val': amount},
+            ReturnValues="UPDATED_NEW"
+        )
+        updated_char = get_character_from_db(char_id)
+        await manager.broadcast(char_id, {"type": "update", "payload": updated_char})
+        action = "Healed" if amount > 0 else "Took Damage"
+        log_msg = f"{action} ({abs(amount)}). HP is now {updated_char['hp']['current']}."
+        await manager.broadcast(char_id, {"type": "log", "message": log_msg})
+        return {"status": "success"}
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.websocket("/ws/{char_id}")
 async def websocket_endpoint(websocket: WebSocket, char_id: str):

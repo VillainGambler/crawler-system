@@ -2,6 +2,7 @@
 import { ref } from 'vue'
 
 const selectedChar = ref('carl_001')
+const gmPassword = ref('') // Store the password locally
 const characters = [
   { id: 'carl_001', name: 'Carl' },
   { id: 'donut_001', name: 'Princess Donut' }
@@ -17,25 +18,34 @@ const newItem = ref({
 const isSending = ref(false)
 const statusMsg = ref('')
 
-// --- FUNCTION 1: GIVE LOOT (Fixed URL) ---
+// Helper for Auth Headers
+const getHeaders = () => {
+  return {
+    'Content-Type': 'application/json',
+    'X-GM-Key': gmPassword.value // Inject Security Token
+  }
+}
+
+// --- FUNCTION 1: GIVE LOOT ---
 async function sendLoot() {
   if (!newItem.value.name) return
   isSending.value = true
   statusMsg.value = "Transmitting..."
 
   try {
-    // 👇 USING ORIGINAL URL STRUCTURE (No /api)
-    await fetch(`/character/${selectedChar.value}/add-item`, {
+    const res = await fetch(`/character/${selectedChar.value}/add-item`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getHeaders(),
       body: JSON.stringify(newItem.value)
     })
     
+    if (!res.ok) throw new Error(await res.text())
+
     statusMsg.value = `SUCCESS: Sent ${newItem.value.count}x ${newItem.value.name} to ${selectedChar.value}`
     newItem.value.name = ''
     newItem.value.count = 1
-  } catch (err) {
-    statusMsg.value = "ERROR: Transmission Failed."
+  } catch (err: any) {
+    statusMsg.value = "ERROR: Transmission Failed (Check Password?)"
     console.error(err)
   } finally {
     isSending.value = false
@@ -46,12 +56,17 @@ async function sendLoot() {
 // --- FUNCTION 2: ADJUST HP ---
 async function adjustRemoteHP(amount: number) {
   try {
-    await fetch(`/character/${selectedChar.value}/adjust-hp?amount=${amount}`, { method: 'POST' })
+    const res = await fetch(`/character/${selectedChar.value}/adjust-hp?amount=${amount}`, { 
+      method: 'POST',
+      headers: getHeaders()
+    })
+    if (!res.ok) throw new Error(await res.text())
+    
     statusMsg.value = `Updated HP for ${selectedChar.value}`
     setTimeout(() => statusMsg.value = '', 2000)
   } catch (e) {
     console.error(e)
-    statusMsg.value = "ERROR: Connection Lost"
+    statusMsg.value = "ERROR: Access Denied"
   }
 }
 
@@ -60,7 +75,12 @@ async function triggerLevelUp() {
   if(!confirm("Are you sure you want to LEVEL UP this character?")) return;
   
   try {
-    await fetch(`/character/${selectedChar.value}/level-up`, { method: 'POST' })
+    const res = await fetch(`/character/${selectedChar.value}/level-up`, { 
+      method: 'POST',
+      headers: getHeaders()
+    })
+    if (!res.ok) throw new Error(await res.text())
+
     statusMsg.value = `LEVEL UP: ${selectedChar.value}`
     setTimeout(() => statusMsg.value = '', 2000)
   } catch (e) {
@@ -72,7 +92,12 @@ async function triggerLevelUp() {
 // --- FUNCTION 4: ADJUST GOLD ---
 async function adjustGold(amount: number) {
   try {
-    await fetch(`/character/${selectedChar.value}/adjust-gold?amount=${amount}`, { method: 'POST' })
+    const res = await fetch(`/character/${selectedChar.value}/adjust-gold?amount=${amount}`, { 
+      method: 'POST',
+      headers: getHeaders()
+    })
+    if (!res.ok) throw new Error(await res.text())
+
     statusMsg.value = `Transaction Complete: ${amount} GP`
     setTimeout(() => statusMsg.value = '', 2000)
   } catch (e) {
@@ -91,6 +116,16 @@ async function adjustGold(amount: number) {
 
     <div class="w-full max-w-md space-y-6">
       
+      <div class="bg-gray-900/50 p-4 border border-red-800 rounded">
+        <label class="block text-xs uppercase tracking-widest text-red-700 mb-2">Security Clearance Code</label>
+        <input 
+          v-model="gmPassword" 
+          type="password" 
+          placeholder="ENTER GM TOKEN..." 
+          class="w-full bg-black border border-red-900 p-2 text-white focus:border-red-500 focus:outline-none placeholder-red-900/50"
+        >
+      </div>
+
       <div class="bg-gray-900/50 p-4 border border-red-800 rounded">
         <label class="block text-xs uppercase tracking-widest text-red-700 mb-2">Target Entity</label>
         <div class="flex gap-2">
